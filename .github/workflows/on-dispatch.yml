@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggered by: a push to AlexWork93/playwright_app_mocking
+#
+# Pattern: the "application" repo fires a repository_dispatch event after every
+# commit. This workflow wakes up and runs the API smoke tests to verify the
+# backend is healthy after the change.
+#
+# Why API only (not full E2E)?
+#   API tests run in ~30 s with no browser. They catch broken endpoints
+#   immediately. Full E2E runs in the daily schedule where slower is fine.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: API Smoke — on app commit
+
+on:
+  repository_dispatch:
+    types: [app-updated]          # event-type sent by playwright_app_mocking
+
+  # Allow manual trigger from the Actions tab — useful for demos and debugging
+  workflow_dispatch:
+
+jobs:
+  api-smoke:
+    name: API Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'            # caches node_modules between runs
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Playwright browsers are ~300 MB each.
+      # We cache them keyed on package-lock.json so they're only downloaded
+      # when the Playwright version actually changes — not on every run.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browsers
+        # Install browsers + OS-level system deps.
+        # On a cache hit we still need system deps (apt packages) — hence
+        # --with-deps even when cache restores the binaries.
+        run: npx playwright install --with-deps chromium
+
+      - name: Run API tests
+        run: npm run test:api
+
+      # Upload the HTML report as a downloadable artifact.
+      # Visible in the Actions tab → click the run → Artifacts section.
+      # 'if: always()' ensures we get the report even when tests fail —
+      # which is exactly when you need it most.
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-report-${{ github.run_id }}
+          path: playwright-report/
+          retention-days: 14

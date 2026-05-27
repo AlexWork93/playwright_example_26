@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduled full-suite regression — runs every day at 08:00 UTC.
+#
+# Job order:
+#   api → e2e (matrix: chromium + firefox in parallel)
+#
+# Why api runs first?
+#   If the backend is completely broken the E2E tests will fail for the wrong
+#   reason. Running API tests first gives a fast, clear signal:
+#   "fix the API before looking at browser failures."
+#
+# Why matrix for E2E?
+#   Instead of one job that runs chromium then firefox sequentially, GitHub
+#   spins up two runners in parallel — cutting wall-clock time roughly in half.
+#   Each browser gets its own artifact so reports don't overwrite each other.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Daily Full Suite
+
+on:
+  schedule:
+    - cron: '0 8 * * *'           # 08:00 UTC every day
+
+  # Manual trigger — great for demos: go to Actions tab → Daily Full Suite → Run workflow
+  workflow_dispatch:
+
+jobs:
+
+  # ── Stage 1: API ─────────────────────────────────────────────────────────────
+  api:
+    name: API Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Run API tests
+        run: npm run test:api
+
+      - name: Upload API report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-api
+          path: playwright-report/
+          retention-days: 30
+
+  # ── Stage 2: E2E (parallel matrix) ───────────────────────────────────────────
+  e2e:
+    name: E2E — ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: api                     # only start once API stage passes
+
+    strategy:
+      fail-fast: false             # if chromium fails, keep running firefox
+      matrix:
+        browser: [chromium, firefox]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install browser — ${{ matrix.browser }}
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E tests — ${{ matrix.browser }}
+        run: npx playwright test --project=${{ matrix.browser }}
+
+      - name: Upload E2E report — ${{ matrix.browser }}
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-e2e-${{ matrix.browser }}
+          path: playwright-report/
+          retention-days: 30
