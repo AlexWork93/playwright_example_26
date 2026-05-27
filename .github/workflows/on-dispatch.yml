@@ -1,22 +1,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Triggered by: a push to AlexWork93/playwright_app_mocking
 #
-# Pattern: the "application" repo fires a repository_dispatch event after every
-# commit. This workflow wakes up and runs the API smoke tests to verify the
-# backend is healthy after the change.
-#
-# Why API only (not full E2E)?
-#   API tests run in ~30 s with no browser. They catch broken endpoints
-#   immediately. Full E2E runs in the daily schedule where slower is fine.
+# After tests finish this workflow posts a commit status back to the
+# originating repo so GitHub branch protection can block/allow the merge.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: API Smoke — on app commit
 
 on:
   repository_dispatch:
-    types: [app-updated]          # event-type sent by playwright_app_mocking
-
-  # Allow manual trigger from the Actions tab — useful for demos and debugging
+    types: [app-updated]
   workflow_dispatch:
 
 jobs:
@@ -26,41 +19,28 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'            # caches node_modules between runs
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
-      # Playwright browsers are ~300 MB each.
-      # We cache them keyed on package-lock.json so they're only downloaded
-      # when the Playwright version actually changes — not on every run.
       - name: Cache Playwright browsers
         uses: actions/cache@v4
-        id: pw-cache
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
-      - name: Install Playwright browsers
-        # Install browsers + OS-level system deps.
-        # On a cache hit we still need system deps (apt packages) — hence
-        # --with-deps even when cache restores the binaries.
-        run: npx playwright install --with-deps chromium
+      - run: npx playwright install --with-deps chromium
 
+      # Give the test step an id so we can read its outcome afterwards
       - name: Run API tests
+        id: api-tests
         run: npm run test:api
 
-      # Upload the HTML report as a downloadable artifact.
-      # Visible in the Actions tab → click the run → Artifacts section.
-      # 'if: always()' ensures we get the report even when tests fail —
-      # which is exactly when you need it most.
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
         if: always()
@@ -68,3 +48,35 @@ jobs:
           name: api-report-${{ github.run_id }}
           path: playwright-report/
           retention-days: 14
+
+      # ── Report result back to the triggering repo ───────────────────────────
+      # This step runs even when tests fail (if: always()) so the commit status
+      # is never left stuck on "pending" regardless of outcome.
+      #
+      # PLAYWRIGHT_SUITE_PAT must be added as a secret in THIS repo too —
+      # it needs write access to playwright_app_mocking to post the status.
+      - name: Post commit status to app repo
+        if: always() && github.event_name == 'repository_dispatch'
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPO:  ${{ github.event.client_payload.repo }}
+          TARGET_SHA:   ${{ github.event.client_payload.sha }}
+          TEST_OUTCOME: ${{ steps.api-tests.outcome }}
+          RUN_ID:       ${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.TARGET_REPO.split('/')
+            const passed        = process.env.TEST_OUTCOME === 'success'
+
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha:         process.env.TARGET_SHA,
+              state:       passed ? 'success' : 'failure',
+              context:     'playwright / api-smoke',
+              description: passed ? '✓ All API tests passed' : '✗ API tests failed',
+              target_url:  `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.RUN_ID}`,
+            })
+
+            console.log(`Posted ${passed ? 'success' : 'failure'} to ${process.env.TARGET_REPO}@${process.env.TARGET_SHA.slice(0,7)}`)
