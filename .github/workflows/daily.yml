@@ -17,7 +17,7 @@
 
 name: Daily Full Suite
 
-run-name: "playwright_example_26 main → main — daily"
+run-name: "playwright_example_26 ${{ github.ref_name }} — daily"
 
 on:
   schedule:
