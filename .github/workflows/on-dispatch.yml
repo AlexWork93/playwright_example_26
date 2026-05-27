@@ -7,6 +7,11 @@
 
 name: API Smoke — on app commit
 
+run-name: >-
+  ${{ github.event_name == 'repository_dispatch'
+    && format('{0} {1} → main', github.event.client_payload.repo_name, github.event.client_payload.ref_name)
+    || 'playwright_example_26 — manual trigger' }}
+
 on:
   repository_dispatch:
     types: [app-updated]

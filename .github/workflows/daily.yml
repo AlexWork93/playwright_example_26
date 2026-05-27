@@ -17,6 +17,8 @@
 
 name: Daily Full Suite
 
+run-name: "playwright_example_26 main → main — daily"
+
 on:
   schedule:
     - cron: '0 8 * * *'           # 08:00 UTC every day
