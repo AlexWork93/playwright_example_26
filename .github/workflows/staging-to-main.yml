@@ -18,7 +18,7 @@ run-name: "playwright_app_mocking staging → main — Thursday deploy ${{ githu
 
 on:
   schedule:
-    - cron: '0 14 * * 4'   # Thursday 17:00 Kyiv (EEST = UTC+3)
+    - cron: '17 15 * * 4'  # Thursday 18:17 Kyiv (EEST = UTC+3)
   workflow_dispatch:
 
 env:
