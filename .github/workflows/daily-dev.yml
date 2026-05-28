@@ -15,7 +15,7 @@ run-name: "playwright_example_26 ${{ github.ref_name }} — daily dev"
 
 on:
   schedule:
-    - cron: '0 8 * * *'     # 08:00 UTC every day
+    - cron: '0 5 * * *'     # 08:00 Kyiv (EEST = UTC+3) every day
   workflow_dispatch:
 
 env:
