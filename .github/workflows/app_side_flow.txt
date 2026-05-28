@@ -1,0 +1,42 @@
+name: Trigger Playwright Tests
+
+run-name: "${{ github.event.repository.name }} ${{ github.head_ref }} → ${{ github.base_ref }}"
+
+on:
+  pull_request:
+    branches-ignore:
+      - main
+      - staging
+
+permissions:
+  statuses: write
+
+jobs:
+  trigger:
+    name: Notify playwright_example_26
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set commit status → pending
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              sha:         context.payload.pull_request.head.sha,
+              state:       'pending',
+              context:     'playwright / api-smoke',
+              description: 'API smoke tests running…',
+            })
+
+      - name: Send dispatch to playwright_example_26
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          repository: AlexWork93/playwright_example_26
+          event-type: app-updated
+          client-payload: >
+            {"sha": "${{ github.event.pull_request.head.sha }}", "repo": "${{ github.repository }}",
+             "repo_name": "${{ github.event.repository.name }}", "ref_name": "${{ github.head_ref }}",
+             "base_ref": "${{ github.base_ref }}"}
