@@ -95,17 +95,16 @@ jobs:
         if: steps.connectivity.outputs.site_blocked == 'false'
         run: npm run test:api
 
-      - name: Skip notice (site blocked by Cloudflare)
-        if: steps.connectivity.outputs.site_blocked == 'true'
+      - name: Connectivity notice
+        if: always()
         run: |
-          echo "::notice::API tests skipped — automationexercise.com is unreachable from this runner."
-          echo "::notice::In production, point API_URL at your own staging environment."
-
-      - name: Connectivity notice (tests ran normally)
-        if: steps.connectivity.outputs.site_blocked == 'false'
-        run: |
-          echo "::notice::✓ Connectivity check passed — target site returned a valid JSON response."
-          echo "::notice::Tests were not skipped due to a Cloudflare block; all scenarios executed against the live API."
+          if [ "${{ steps.connectivity.outputs.site_blocked }}" = "true" ]; then
+            echo "::warning::API tests skipped — automationexercise.com is unreachable from this runner."
+            echo "::warning::In production, point API_URL at your own staging environment."
+          else
+            echo "::notice::✓ Connectivity check passed — target site returned a valid JSON response."
+            echo "::notice::Tests were not skipped due to a Cloudflare block; all scenarios executed against the live API."
+          fi
 
       - name: Upload API report
         uses: actions/upload-artifact@v4
