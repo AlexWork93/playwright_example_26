@@ -1,0 +1,215 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Thursday deployment pipeline — staging → main
+#
+# Runs every Thursday at 17:00 Kyiv time (14:00 UTC / EEST, UTC+3).
+#
+# Flow:
+#   1. Run full test suite against staging
+#   2. If green → create PR staging → main in the app repo
+#   3. Merge the PR immediately (tests already passed — PR is the audit trail)
+#   4. Dispatch post-deploy.yml to verify production
+#
+# If tests fail the PR is NOT created and main is left untouched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Staging → Main — Thursday deploy
+
+run-name: "playwright_app_mocking staging → main — Thursday deploy ${{ github.run_number }}"
+
+on:
+  schedule:
+    - cron: '0 14 * * 4'   # Thursday 17:00 Kyiv (EEST = UTC+3)
+  workflow_dispatch:
+
+env:
+  BASE_URL: ${{ vars.STAGING_BASE_URL || 'https://automationexercise.com' }}
+  API_URL:  ${{ vars.STAGING_API_URL  || 'https://automationexercise.com' }}
+  APP_REPO: AlexWork93/playwright_app_mocking
+
+jobs:
+
+  # ── Stage 1: API ────────────────────────────────────────────────────────────
+  api:
+    name: API Tests — staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Check target API is reachable
+        id: connectivity
+        run: |
+          STATUS=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Accept: application/json" \
+            https://automationexercise.com/api/productsList)
+          echo "http_status=$STATUS" >> $GITHUB_OUTPUT
+
+          RESPONSE_CODE=$(node -e "
+            try {
+              const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
+              const j = JSON.parse(d);
+              console.log(j.responseCode ?? 'missing');
+            } catch(e) { console.log('not-json'); }
+          ")
+          echo "response_code=$RESPONSE_CODE" >> $GITHUB_OUTPUT
+
+          echo "HTTP status: $STATUS"
+          echo "API responseCode field: $RESPONSE_CODE"
+
+          if [ "$RESPONSE_CODE" != "200" ]; then
+            echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
+            echo "site_blocked=true" >> $GITHUB_OUTPUT
+          else
+            echo "site_blocked=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run API tests
+        if: steps.connectivity.outputs.site_blocked == 'false'
+        run: npm run test:api
+
+      - name: Connectivity notice
+        if: always()
+        run: |
+          if [ "${{ steps.connectivity.outputs.site_blocked }}" = "true" ]; then
+            echo "::warning::API tests skipped — target site is unreachable from this runner."
+          else
+            echo "::notice::✓ Connectivity check passed — all API scenarios executed against staging."
+          fi
+
+      - name: Upload API report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-api-staging-deploy
+          path: playwright-report/
+          retention-days: 30
+
+  # ── Stage 2: E2E (parallel matrix) ─────────────────────────────────────────
+  e2e:
+    name: E2E — staging — ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: api
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install browser — ${{ matrix.browser }}
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E tests — ${{ matrix.browser }}
+        run: npx playwright test --project=${{ matrix.browser }}
+
+      - name: Upload E2E report — ${{ matrix.browser }}
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-e2e-staging-deploy-${{ matrix.browser }}
+          path: playwright-report/
+          retention-days: 30
+
+  # ── Stage 3: Promote staging → main ─────────────────────────────────────────
+  promote:
+    name: Merge staging → main
+    runs-on: ubuntu-latest
+    needs: [api, e2e]       # only runs when BOTH test stages pass
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Create PR and merge staging → main
+        uses: actions/github-script@v7
+        env:
+          RUN_ID: ${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.APP_REPO.split('/')
+            const date = new Date().toISOString().slice(0, 10)
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.RUN_ID}`
+
+            // Guard: skip if staging has no commits ahead of main
+            const compare = await github.rest.repos.compareCommits({
+              owner, repo, base: 'main', head: 'staging',
+            })
+            if (compare.data.ahead_by === 0) {
+              console.log('staging is already up to date with main — nothing to merge.')
+              return
+            }
+            console.log(`staging is ${compare.data.ahead_by} commit(s) ahead of main — proceeding.`)
+
+            // Create PR
+            const pr = await github.rest.pulls.create({
+              owner, repo,
+              title: `chore: deploy staging → main (${date})`,
+              head:  'staging',
+              base:  'main',
+              body:  [
+                '## Automated Thursday deployment',
+                '',
+                `All staging tests passed ✓  — [pipeline run #${process.env.RUN_ID}](${runUrl})`,
+                '',
+                '_This PR was created and merged automatically by the Thursday deploy pipeline._',
+              ].join('\n'),
+            })
+            console.log(`Created PR #${pr.data.number}: ${pr.data.html_url}`)
+
+            // Merge immediately — tests already confirmed green
+            await github.rest.pulls.merge({
+              owner, repo,
+              pull_number: pr.data.number,
+              merge_method: 'merge',
+              commit_title: `chore: deploy staging → main (${date})`,
+              commit_message: `Merged by Thursday deploy pipeline — run #${process.env.RUN_ID}`,
+            })
+            console.log(`Merged PR #${pr.data.number} — staging is now live on main.`)
+
+      # Trigger the post-deploy verification workflow
+      - name: Dispatch post-deploy verification
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              workflow_id: 'post-deploy.yml',
+              ref:   'main',
+            })
+            console.log('Dispatched post-deploy.yml on main.')

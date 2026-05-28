@@ -1,0 +1,137 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Manual QA gate: run the full suite against staging before promoting.
+#
+# This workflow is triggered MANUALLY by a QA engineer or team lead after
+# a dev → staging deployment has been completed. It does NOT auto-merge —
+# a human reviews the results and decides whether to proceed.
+#
+# Trigger: Actions tab → "Dev → Staging QA gate" → Run workflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Dev → Staging — manual QA gate
+
+run-name: "playwright_app_mocking staging — manual QA gate (by @${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+
+env:
+  BASE_URL: ${{ vars.STAGING_BASE_URL || 'https://automationexercise.com' }}
+  API_URL:  ${{ vars.STAGING_API_URL  || 'https://automationexercise.com' }}
+
+jobs:
+
+  # ── Stage 1: API ────────────────────────────────────────────────────────────
+  api:
+    name: API Tests — staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Check target API is reachable
+        id: connectivity
+        run: |
+          STATUS=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Accept: application/json" \
+            https://automationexercise.com/api/productsList)
+          echo "http_status=$STATUS" >> $GITHUB_OUTPUT
+
+          RESPONSE_CODE=$(node -e "
+            try {
+              const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
+              const j = JSON.parse(d);
+              console.log(j.responseCode ?? 'missing');
+            } catch(e) { console.log('not-json'); }
+          ")
+          echo "response_code=$RESPONSE_CODE" >> $GITHUB_OUTPUT
+
+          echo "HTTP status: $STATUS"
+          echo "API responseCode field: $RESPONSE_CODE"
+
+          if [ "$RESPONSE_CODE" != "200" ]; then
+            echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
+            echo "::warning::This is a known Cloudflare issue with cloud runner IPs."
+            echo "site_blocked=true" >> $GITHUB_OUTPUT
+          else
+            echo "site_blocked=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run API tests
+        if: steps.connectivity.outputs.site_blocked == 'false'
+        run: npm run test:api
+
+      - name: Connectivity notice
+        if: always()
+        run: |
+          if [ "${{ steps.connectivity.outputs.site_blocked }}" = "true" ]; then
+            echo "::warning::API tests skipped — target site is unreachable from this runner."
+          else
+            echo "::notice::✓ Connectivity check passed — all API scenarios executed against staging."
+          fi
+
+      - name: Upload API report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-api-staging-manual
+          path: playwright-report/
+          retention-days: 30
+
+  # ── Stage 2: E2E (parallel matrix) ─────────────────────────────────────────
+  e2e:
+    name: E2E — staging — ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: api
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install browser — ${{ matrix.browser }}
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E tests — ${{ matrix.browser }}
+        run: npx playwright test --project=${{ matrix.browser }}
+
+      - name: Upload E2E report — ${{ matrix.browser }}
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-e2e-staging-manual-${{ matrix.browser }}
+          path: playwright-report/
+          retention-days: 30

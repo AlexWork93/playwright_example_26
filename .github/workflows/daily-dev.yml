@@ -1,36 +1,32 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduled full-suite regression — runs every day at 08:00 UTC.
+# Daily regression against the DEV environment.
+# Purpose: catch regressions in development before they reach staging.
 #
-# Job order:
-#   api → e2e (matrix: chromium + firefox in parallel)
+# In a real project BASE_URL / API_URL would be set as GitHub repository
+# variables pointing at your dev server. Here they fall back to the public
+# demo site because this is a portfolio project with no real environments.
 #
-# Why api runs first?
-#   If the backend is completely broken the E2E tests will fail for the wrong
-#   reason. Running API tests first gives a fast, clear signal:
-#   "fix the API before looking at browser failures."
-#
-# Why matrix for E2E?
-#   Instead of one job that runs chromium then firefox sequentially, GitHub
-#   spins up two runners in parallel — cutting wall-clock time roughly in half.
-#   Each browser gets its own artifact so reports don't overwrite each other.
+# Job order: api → e2e (chromium + firefox in parallel)
 # ─────────────────────────────────────────────────────────────────────────────
 
-name: Daily Full Suite
+name: Daily — dev environment
 
-run-name: "playwright_example_26 ${{ github.ref_name }} — daily"
+run-name: "playwright_example_26 ${{ github.ref_name }} — daily dev"
 
 on:
   schedule:
-    - cron: '0 8 * * *'           # 08:00 UTC every day
-
-  # Manual trigger — great for demos: go to Actions tab → Daily Full Suite → Run workflow
+    - cron: '0 8 * * *'     # 08:00 UTC every day
   workflow_dispatch:
+
+env:
+  BASE_URL: ${{ vars.DEV_BASE_URL || 'https://automationexercise.com' }}
+  API_URL:  ${{ vars.DEV_API_URL  || 'https://automationexercise.com' }}
 
 jobs:
 
-  # ── Stage 1: API ─────────────────────────────────────────────────────────────
+  # ── Stage 1: API ────────────────────────────────────────────────────────────
   api:
-    name: API Tests
+    name: API Tests — dev
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -52,15 +48,6 @@ jobs:
 
       - run: npx playwright install --with-deps chromium
 
-      # ── Connectivity check ──────────────────────────────────────────────────
-      # automationexercise.com sits behind Cloudflare which rate-limits or blocks
-      # cloud provider IPs. We verify the API returns real JSON before running
-      # tests — if it returns an HTML challenge page the tests would fail with
-      # misleading "responseCode: undefined" errors.
-      #
-      # On a real project this step would be removed because you'd test against
-      # your own staging environment (set via API_URL secret), not a third-party
-      # site that can block GitHub Actions runners.
       - name: Check target API is reachable
         id: connectivity
         run: |
@@ -69,7 +56,6 @@ jobs:
             https://automationexercise.com/api/productsList)
           echo "http_status=$STATUS" >> $GITHUB_OUTPUT
 
-          # Check the response is actually JSON with responseCode (not a Cloudflare HTML page)
           RESPONSE_CODE=$(node -e "
             try {
               const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
@@ -85,7 +71,6 @@ jobs:
           if [ "$RESPONSE_CODE" != "200" ]; then
             echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
             echo "::warning::This is a known Cloudflare issue with cloud runner IPs."
-            echo "::warning::Skipping API tests — not a code defect."
             echo "site_blocked=true" >> $GITHUB_OUTPUT
           else
             echo "site_blocked=false" >> $GITHUB_OUTPUT
@@ -100,7 +85,7 @@ jobs:
         run: |
           if [ "${{ steps.connectivity.outputs.site_blocked }}" = "true" ]; then
             echo "::warning::API tests skipped — automationexercise.com is unreachable from this runner."
-            echo "::warning::In production, point API_URL at your own staging environment."
+            echo "::warning::In production, point API_URL at your own dev server."
           else
             echo "::notice::✓ Connectivity check passed — target site returned a valid JSON response."
             echo "::notice::Tests were not skipped due to a Cloudflare block; all scenarios executed against the live API."
@@ -110,19 +95,19 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: report-api
+          name: report-api-dev
           path: playwright-report/
           retention-days: 30
 
-  # ── Stage 2: E2E (parallel matrix) ───────────────────────────────────────────
+  # ── Stage 2: E2E (parallel matrix) ─────────────────────────────────────────
   e2e:
-    name: E2E — ${{ matrix.browser }}
+    name: E2E — dev — ${{ matrix.browser }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: api                     # only start once API stage passes
+    needs: api
 
     strategy:
-      fail-fast: false             # if chromium fails, keep running firefox
+      fail-fast: false
       matrix:
         browser: [chromium, firefox]
 
@@ -152,6 +137,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: report-e2e-${{ matrix.browser }}
+          name: report-e2e-dev-${{ matrix.browser }}
           path: playwright-report/
           retention-days: 30
