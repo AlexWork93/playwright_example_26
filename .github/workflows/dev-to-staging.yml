@@ -5,6 +5,12 @@
 # a dev → staging deployment has been completed. It does NOT auto-merge —
 # a human reviews the results and decides whether to proceed.
 #
+# Flow:
+#   1. Fetch the current dev branch HEAD SHA from playwright_app_mocking
+#   2. Post 'pending' commit status on that SHA
+#   3. Run full test suite against staging
+#   4. Post 'success' or 'failure' — unblocking or keeping the merge blocked
+#
 # Trigger: Actions tab → "Dev → Staging QA gate" → Run workflow
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -18,14 +24,45 @@ on:
 env:
   BASE_URL: ${{ vars.STAGING_BASE_URL || 'https://automationexercise.com' }}
   API_URL:  ${{ vars.STAGING_API_URL  || 'https://automationexercise.com' }}
+  APP_REPO: AlexWork93/playwright_app_mocking
 
 jobs:
+
+  # ── Pre-flight: stamp commit as pending ─────────────────────────────────────
+  pre-notify:
+    name: Set status → pending
+    runs-on: ubuntu-latest
+
+    outputs:
+      dev_sha: ${{ steps.get-sha.outputs.sha }}
+
+    steps:
+      - name: Fetch dev HEAD SHA and post pending
+        id: get-sha
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.APP_REPO.split('/')
+
+            const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: 'dev' })
+            const sha = branch.commit.sha
+            core.setOutput('sha', sha)
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              state:       'pending',
+              context:     'playwright / staging-gate',
+              description: 'Staging QA gate running…',
+            })
+            console.log(`Posted 'pending' on ${owner}/${repo}@${sha.slice(0,7)}`)
 
   # ── Stage 1: API ────────────────────────────────────────────────────────────
   api:
     name: API Tests — staging
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: pre-notify
 
     steps:
       - uses: actions/checkout@v4
@@ -135,3 +172,38 @@ jobs:
           name: report-e2e-staging-manual-${{ matrix.browser }}
           path: playwright-report/
           retention-days: 30
+
+  # ── Post-flight: stamp final result ─────────────────────────────────────────
+  post-notify:
+    name: Post final status
+    runs-on: ubuntu-latest
+    needs: [pre-notify, api, e2e]
+    if: always()
+
+    steps:
+      - name: Post success or failure to app repo
+        uses: actions/github-script@v7
+        env:
+          DEV_SHA:    ${{ needs.pre-notify.outputs.dev_sha }}
+          API_RESULT: ${{ needs.api.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          RUN_ID:     ${{ github.run_id }}
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.APP_REPO.split('/')
+            const passed = process.env.API_RESULT === 'success' && process.env.E2E_RESULT === 'success'
+
+            const state       = passed ? 'success' : 'failure'
+            const description = passed ? '✓ All staging tests passed — safe to merge'
+                                       : '✗ Staging tests failed — do not merge'
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo,
+              sha:        process.env.DEV_SHA,
+              state,
+              context:    'playwright / staging-gate',
+              description,
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.RUN_ID}`,
+            })
+            console.log(`Posted '${state}' → ${description}`)
