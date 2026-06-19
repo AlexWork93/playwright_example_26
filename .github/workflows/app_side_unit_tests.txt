@@ -5,30 +5,15 @@ name: Unit Tests
 
 on:
   workflow_dispatch:
-  push:
-    branches: [dev, staging, main]
 
 jobs:
   unit:
-    name: Unit Tests
+    name: Unit Tests (placeholder)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-
-      - run: npm ci
-
       - name: Run unit tests
         run: |
-          # Replace this placeholder with your real unit test command, e.g.:
-          #   npm test
-          #   npx vitest run
-          #   npx jest
-          echo "::notice::Unit tests placeholder — replace with real test command."
-          echo "All unit tests passed."
+          echo "::notice::Unit tests placeholder — always passes."
+          echo "Replace with: npm test / npx jest / npx vitest run"

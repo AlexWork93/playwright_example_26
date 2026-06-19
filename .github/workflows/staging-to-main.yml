@@ -4,7 +4,7 @@
 # Runs every Friday at 09:00 Kyiv time (06:00 UTC / EEST, UTC+3).
 #
 # Pyramid:
-#   L1 Unit         → triggers unit-tests.yml in app repo (staging branch), waits
+#   L1 Unit         → triggers app_side_unit_tests.yml in app repo (staging branch), waits
 #   L2 Integration  → API + DB in parallel (needs L1 green)
 #   L3 E2E          → chromium + firefox in parallel (needs L2 green)
 #   Promote         → creates PR staging→main, merges it, fires post-deploy
@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Trigger unit-tests.yml in app repo and wait
+      - name: Trigger app_side_unit_tests.yml in app repo and wait
         uses: actions/github-script@v7
         env:
           UNIT_TEST_REF: staging
@@ -42,7 +42,7 @@ jobs:
           script: |
             const [owner, repo] = process.env.APP_REPO.split('/')
             const ref           = process.env.UNIT_TEST_REF
-            const workflowId    = 'unit-tests.yml'
+            const workflowId    = 'app_side_unit_tests.yml'
             const createdAfter  = new Date().toISOString()
 
             await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflowId, ref })

@@ -2,7 +2,7 @@
 # Manual QA gate — full testing pyramid against staging before promoting.
 #
 # Pyramid:
-#   L1 Unit         → triggers unit-tests.yml in app repo (dev branch), waits
+#   L1 Unit         → triggers app_side_unit_tests.yml in app repo (dev branch), waits
 #   L2 Integration  → API + DB in parallel (needs L1 green)
 #   L3 E2E          → chromium + firefox in parallel (needs L2 green)
 #
@@ -60,7 +60,7 @@ jobs:
     needs: pre-notify
 
     steps:
-      - name: Trigger unit-tests.yml in app repo and wait
+      - name: Trigger app_side_unit_tests.yml in app repo and wait
         uses: actions/github-script@v7
         env:
           UNIT_TEST_REF: dev
@@ -69,7 +69,7 @@ jobs:
           script: |
             const [owner, repo] = process.env.APP_REPO.split('/')
             const ref           = process.env.UNIT_TEST_REF
-            const workflowId    = 'unit-tests.yml'
+            const workflowId    = 'app_side_unit_tests.yml'
             const createdAfter  = new Date().toISOString()
 
             await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflowId, ref })
