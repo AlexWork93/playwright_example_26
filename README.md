@@ -2,7 +2,7 @@
 
 Test suite for [automationexercise.com](https://automationexercise.com) — a public e-commerce site with UI, REST API, and database layers.
 
-Part of a two-repo CI system alongside `playwright_app_mocking` (the app repo).
+Part of a two-repo CI system alongside `playwright_app_mocking` https://github.com/AlexWork93/playwright_app_mocking (the app repo).
 
 ## Stack
 
