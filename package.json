@@ -14,7 +14,6 @@
     "test:debug": "playwright test --debug",
     "test:ui": "playwright test --ui",
     "report:html": "playwright show-report",
-    "report:allure": "allure generate allure-results --clean && allure open",
     "lint": "tsc --noEmit"
   },
   "keywords": [],
@@ -26,7 +25,6 @@
     "@faker-js/faker": "^10.4.0",
     "@playwright/test": "^1.60.0",
     "@types/node": "^25.9.1",
-    "allure-playwright": "^3.9.0",
     "axe-core": "^4.11.4",
     "dotenv": "^17.4.2",
     "typescript": "^6.0.3"
