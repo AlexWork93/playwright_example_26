@@ -1,20 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Thursday deployment pipeline — staging → main
+# Friday deployment pipeline — staging → main — full testing pyramid.
 #
 # Runs every Friday at 09:00 Kyiv time (06:00 UTC / EEST, UTC+3).
 #
-# Flow:
-#   1. Run full test suite against staging
-#   2. If green → create PR staging → main in the app repo
-#   3. Merge the PR immediately (tests already passed — PR is the audit trail)
-#   4. Dispatch post-deploy.yml to verify production
-#
-# If tests fail the PR is NOT created and main is left untouched.
+# Pyramid:
+#   L1 Unit         → triggers unit-tests.yml in app repo (staging branch), waits
+#   L2 Integration  → API + DB in parallel (needs L1 green)
+#   L3 E2E          → chromium + firefox in parallel (needs L2 green)
+#   Promote         → creates PR staging→main, merges it, fires post-deploy
 # ─────────────────────────────────────────────────────────────────────────────
 
-name: Staging → Main — Thursday deploy
+name: Staging → Main — Friday deploy
 
-run-name: "playwright_app_mocking staging → main — Thursday deploy ${{ github.run_number }}"
+run-name: "playwright_app_mocking staging → main — Friday deploy ${{ github.run_number }}"
 
 on:
   schedule:
@@ -28,30 +26,75 @@ env:
 
 jobs:
 
-  # ── Stage 1: API ────────────────────────────────────────────────────────────
-  api:
-    name: API Tests — staging
+  # ── L1: Unit (app repo) ─────────────────────────────────────────────────────
+  unit:
+    name: "L1 — Unit (app repo / staging)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Trigger unit-tests.yml in app repo and wait
+        uses: actions/github-script@v7
+        env:
+          UNIT_TEST_REF: staging
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.APP_REPO.split('/')
+            const ref           = process.env.UNIT_TEST_REF
+            const workflowId    = 'unit-tests.yml'
+            const createdAfter  = new Date().toISOString()
+
+            await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflowId, ref })
+            console.log(`Dispatched ${workflowId} on ${repo}@${ref}`)
+
+            await new Promise(r => setTimeout(r, 8000))
+
+            let run
+            for (let i = 0; i < 15; i++) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: workflowId, created: `>=${createdAfter}`, per_page: 1
+              })
+              if (data.workflow_runs.length > 0) { run = data.workflow_runs[0]; break }
+              console.log(`Waiting for run to appear... (${i + 1}/15)`)
+              await new Promise(r => setTimeout(r, 4000))
+            }
+            if (!run) return core.setFailed('Could not find the triggered unit test run')
+            console.log(`Found run #${run.id}`)
+
+            let polls = 0
+            while (run.status !== 'completed') {
+              if (polls++ > 20) return core.setFailed('Unit tests timed out')
+              await new Promise(r => setTimeout(r, 15000))
+              const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })
+              run = data
+              console.log(`Status: ${run.status} (poll ${polls})`)
+            }
+
+            console.log(`Conclusion: ${run.conclusion} — ${run.html_url}`)
+            if (run.conclusion !== 'success')
+              core.setFailed(`Unit tests ${run.conclusion} — ${run.html_url}`)
+
+  # ── L2: Integration — API ────────────────────────────────────────────────────
+  integration-api:
+    name: "L2 — Integration / API"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: unit
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - run: npx playwright install --with-deps chromium
-
       - name: Check target API is reachable
         id: connectivity
         run: |
@@ -59,7 +102,6 @@ jobs:
             -H "Accept: application/json" \
             https://automationexercise.com/api/productsList)
           echo "http_status=$STATUS" >> $GITHUB_OUTPUT
-
           RESPONSE_CODE=$(node -e "
             try {
               const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
@@ -68,21 +110,15 @@ jobs:
             } catch(e) { console.log('not-json'); }
           ")
           echo "response_code=$RESPONSE_CODE" >> $GITHUB_OUTPUT
-
-          echo "HTTP status: $STATUS"
-          echo "API responseCode field: $RESPONSE_CODE"
-
           if [ "$RESPONSE_CODE" != "200" ]; then
-            echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
+            echo "::warning::automationexercise.com returned '$RESPONSE_CODE' — Cloudflare issue."
             echo "site_blocked=true" >> $GITHUB_OUTPUT
           else
             echo "site_blocked=false" >> $GITHUB_OUTPUT
           fi
-
       - name: Run API tests
         if: steps.connectivity.outputs.site_blocked == 'false'
         run: npm run test:api
-
       - name: Connectivity notice
         if: always()
         run: |
@@ -91,21 +127,47 @@ jobs:
           else
             echo "::notice::✓ Connectivity check passed — all API scenarios executed against staging."
           fi
-
       - name: Upload API report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: report-api-staging-deploy
+          name: report-integration-api-staging-deploy
           path: playwright-report/
           retention-days: 30
 
-  # ── Stage 2: E2E (parallel matrix) ─────────────────────────────────────────
+  # ── L2: Integration — DB ─────────────────────────────────────────────────────
+  integration-db:
+    name: "L2 — Integration / DB"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: unit
+
+    env:
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run DB tests
+        run: npm run test:db
+      - name: Upload DB report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-integration-db-staging-deploy
+          path: playwright-report/
+          retention-days: 30
+
+  # ── L3: E2E ──────────────────────────────────────────────────────────────────
   e2e:
-    name: E2E — staging — ${{ matrix.browser }}
+    name: "L3 — E2E / ${{ matrix.browser }}"
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: api
+    needs: [integration-api, integration-db]
 
     strategy:
       fail-fast: false
@@ -114,26 +176,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - name: Install browser — ${{ matrix.browser }}
         run: npx playwright install --with-deps ${{ matrix.browser }}
-
       - name: Run E2E tests — ${{ matrix.browser }}
         run: npx playwright test --project=${{ matrix.browser }}
-
       - name: Upload E2E report — ${{ matrix.browser }}
         uses: actions/upload-artifact@v4
         if: always()
@@ -142,11 +198,11 @@ jobs:
           path: playwright-report/
           retention-days: 30
 
-  # ── Stage 3: Promote staging → main ─────────────────────────────────────────
+  # ── Promote: staging → main ───────────────────────────────────────────────────
   promote:
     name: Merge staging → main
     runs-on: ubuntu-latest
-    needs: [api, e2e]       # only runs when BOTH test stages pass
+    needs: [unit, integration-api, integration-db, e2e]
 
     permissions:
       contents: write
@@ -164,7 +220,6 @@ jobs:
             const date = new Date().toISOString().slice(0, 10)
             const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.RUN_ID}`
 
-            // Guard: skip if staging has no commits ahead of main
             const compare = await github.rest.repos.compareCommits({
               owner, repo, base: 'main', head: 'staging',
             })
@@ -172,44 +227,45 @@ jobs:
               console.log('staging is already up to date with main — nothing to merge.')
               return
             }
-            console.log(`staging is ${compare.data.ahead_by} commit(s) ahead of main — proceeding.`)
 
-            // Create PR
             const pr = await github.rest.pulls.create({
               owner, repo,
               title: `chore: deploy staging → main (${date})`,
-              head:  'staging',
-              base:  'main',
-              body:  [
-                '## Automated Thursday deployment',
+              head: 'staging', base: 'main',
+              body: [
+                '## Automated Friday deployment',
                 '',
-                `All staging tests passed ✓  — [pipeline run #${process.env.RUN_ID}](${runUrl})`,
+                `Full testing pyramid passed ✓ — [run #${process.env.RUN_ID}](${runUrl})`,
                 '',
-                '_This PR was created and merged automatically by the Thursday deploy pipeline._',
+                '| Layer | Status |',
+                '|---|---|',
+                '| L1 Unit (app repo / staging) | ✓ |',
+                '| L2 Integration — API | ✓ |',
+                '| L2 Integration — DB  | ✓ |',
+                '| L3 E2E — chromium    | ✓ |',
+                '| L3 E2E — firefox     | ✓ |',
+                '',
+                '_Created and merged automatically by the Friday deploy pipeline._',
               ].join('\n'),
             })
             console.log(`Created PR #${pr.data.number}: ${pr.data.html_url}`)
 
-            // Merge immediately — tests already confirmed green
             await github.rest.pulls.merge({
               owner, repo,
               pull_number: pr.data.number,
               merge_method: 'merge',
               commit_title: `chore: deploy staging → main (${date})`,
-              commit_message: `Merged by Thursday deploy pipeline — run #${process.env.RUN_ID}`,
+              commit_message: `Merged by Friday deploy pipeline — run #${process.env.RUN_ID}`,
             })
-            console.log(`Merged PR #${pr.data.number} — staging is now live on main.`)
+            console.log(`Merged PR #${pr.data.number}`)
 
-      # Trigger the post-deploy verification workflow
       - name: Dispatch post-deploy verification
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              workflow_id: 'post-deploy.yml',
-              ref:   'main',
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'post-deploy.yml', ref: 'main',
             })
             console.log('Dispatched post-deploy.yml on main.')

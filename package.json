@@ -6,6 +6,7 @@
   "scripts": {
     "test": "playwright test",
     "test:api": "playwright test --project=api",
+    "test:db": "playwright test --project=db",
     "test:e2e": "playwright test --project=chromium",
     "test:mobile": "playwright test --project=mobile-chrome",
     "test:perf": "playwright test --project=performance",
@@ -29,5 +30,9 @@
     "axe-core": "^4.11.4",
     "dotenv": "^17.4.2",
     "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@types/pg": "^8.20.0",
+    "pg": "^8.22.0"
   }
 }

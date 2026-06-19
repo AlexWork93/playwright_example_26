@@ -12,9 +12,31 @@ permissions:
   statuses: write
 
 jobs:
-  trigger:
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Run unit tests
+        run: |
+          # Replace with your real unit test command, e.g. npm test / npx vitest run
+          echo "::notice::Unit tests placeholder — replace with real test command."
+          echo "All unit tests passed."
+
+  dispatch:
     name: Notify playwright_example_26
     runs-on: ubuntu-latest
+    needs: unit    # integration + E2E only start after unit tests pass
 
     steps:
       - name: Set commit status → pending
