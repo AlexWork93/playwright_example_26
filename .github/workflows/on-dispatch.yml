@@ -1,11 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Triggered by: a push to AlexWork93/playwright_app_mocking
+# Triggered by: playwright_app_mocking after unit tests pass on the app side.
 #
-# After tests finish this workflow posts a commit status back to the
-# originating repo so GitHub branch protection can block/allow the merge.
+# Pyramid:
+#   L1 Unit       → placeholder (unit tests already ran in app repo before dispatch)
+#   L2 Integration → API + DB in parallel (needs L1)
+#   L3 Smoke      → placeholder for a dedicated smoke suite (needs L2)
+#
+# After all layers finish, posts a commit status back to the app repo so
+# branch protection can block/allow the merge button.
 # ─────────────────────────────────────────────────────────────────────────────
 
-name: API Smoke — on app commit
+name: PR check — on app commit
 
 run-name: >-
   ${{ github.event_name == 'repository_dispatch'
@@ -17,39 +22,56 @@ on:
     types: [app-updated]
   workflow_dispatch:
 
+env:
+  APP_REPO: AlexWork93/playwright_app_mocking
+
 jobs:
-  api-smoke:
-    name: API Tests
+
+  # ── L1: Unit ─────────────────────────────────────────────────────────────────
+  # Unit tests already ran in the app repo before the dispatch was sent.
+  # This stage is a placeholder — add playwright-side unit concerns here if needed.
+  unit:
+    name: "L1 — Unit (placeholder)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Unit tests acknowledged
+        run: |
+          echo "::notice::Unit tests ran in playwright_app_mocking before this dispatch was sent."
+          echo "::notice::Add any playwright-repo unit concerns here when needed."
+
+  # ── L2: Integration — API ────────────────────────────────────────────────────
+  integration-api:
+    name: "L2 — Integration / API"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: unit
+
+    outputs:
+      site_blocked: ${{ steps.connectivity.outputs.site_blocked }}
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - run: npx playwright install --with-deps chromium
 
-      # ── Connectivity check ──────────────────────────────────────────────────
       # automationexercise.com sits behind Cloudflare which rate-limits or blocks
       # cloud provider IPs. We verify the API returns real JSON before running
       # tests — if it returns an HTML challenge page the tests would fail with
       # misleading "responseCode: undefined" errors.
       #
-      # On a real project this step would be removed because you'd test against
-      # your own staging environment (set via API_URL secret), not a third-party
-      # site that can block GitHub Actions runners.
+      # On a real project this step is removed because you test against your own
+      # staging environment (API_URL secret), not a third-party site.
       - name: Check target API is reachable
         id: connectivity
         run: |
@@ -57,8 +79,6 @@ jobs:
             -H "Accept: application/json" \
             https://automationexercise.com/api/productsList)
           echo "http_status=$STATUS" >> $GITHUB_OUTPUT
-
-          # Check the response is actually JSON with responseCode (not a Cloudflare HTML page)
           RESPONSE_CODE=$(node -e "
             try {
               const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
@@ -67,13 +87,10 @@ jobs:
             } catch(e) { console.log('not-json'); }
           ")
           echo "response_code=$RESPONSE_CODE" >> $GITHUB_OUTPUT
-
           echo "HTTP status: $STATUS"
           echo "API responseCode field: $RESPONSE_CODE"
-
           if [ "$RESPONSE_CODE" != "200" ]; then
-            echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
-            echo "::warning::This is a known Cloudflare issue with cloud runner IPs."
+            echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' — Cloudflare issue."
             echo "::warning::Skipping API tests — not a code defect."
             echo "site_blocked=true" >> $GITHUB_OUTPUT
           else
@@ -85,55 +102,102 @@ jobs:
         if: steps.connectivity.outputs.site_blocked == 'false'
         run: npm run test:api
 
-      # If Cloudflare blocked us, mark the step as skipped rather than failed
-      # so the commit status reflects "infrastructure unavailable", not "tests broken"
       - name: Connectivity notice
         if: always()
         run: |
           if [ "${{ steps.connectivity.outputs.site_blocked }}" = "true" ]; then
             echo "::warning::API tests skipped — automationexercise.com is unreachable from this runner."
-            echo "::warning::In production, point API_URL at your own staging environment."
           else
-            echo "::notice::✓ Connectivity check passed — target site returned a valid JSON response."
-            echo "::notice::Tests were not skipped due to a Cloudflare block; all scenarios executed against the live API."
+            echo "::notice::✓ Connectivity check passed — all API scenarios executed."
           fi
 
-      - name: Upload HTML report
+      - name: Upload API report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: api-report-${{ github.run_id }}
+          name: report-integration-api-pr-${{ github.run_id }}
           path: playwright-report/
           retention-days: 14
 
-      # ── Report result back to the triggering repo ───────────────────────────
+  # ── L2: Integration — DB ─────────────────────────────────────────────────────
+  integration-db:
+    name: "L2 — Integration / DB"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: unit
+
+    env:
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run DB tests
+        run: npm run test:db
+      - name: Upload DB report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-integration-db-pr-${{ github.run_id }}
+          path: playwright-report/
+          retention-days: 14
+
+  # ── L3: Smoke ────────────────────────────────────────────────────────────────
+  # Placeholder for a dedicated smoke suite (critical path E2E, fast subset).
+  # Replace the echo with: npx playwright test --project=smoke
+  smoke:
+    name: "L3 — Smoke (placeholder)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [integration-api, integration-db]
+
+    steps:
+      - name: Smoke suite placeholder
+        run: |
+          echo "::notice::Smoke suite placeholder — add a fast critical-path E2E suite here."
+          echo "::notice::Replace this step with: npx playwright test --project=smoke"
+
+  # ── Post-notify: report result back to app repo ───────────────────────────────
+  post-notify:
+    name: Post commit status
+    runs-on: ubuntu-latest
+    needs: [unit, integration-api, integration-db, smoke]
+    if: always() && github.event_name == 'repository_dispatch'
+
+    steps:
       - name: Post commit status to app repo
-        if: always() && github.event_name == 'repository_dispatch'
         uses: actions/github-script@v7
         env:
-          TARGET_REPO:    ${{ github.event.client_payload.repo }}
-          TARGET_SHA:     ${{ github.event.client_payload.sha }}
-          TEST_OUTCOME:   ${{ steps.api-tests.outcome }}
-          SITE_BLOCKED:   ${{ steps.connectivity.outputs.site_blocked }}
-          RUN_ID:         ${{ github.run_id }}
+          TARGET_REPO:   ${{ github.event.client_payload.repo }}
+          TARGET_SHA:    ${{ github.event.client_payload.sha }}
+          RUN_ID:        ${{ github.run_id }}
+          UNIT_RES:      ${{ needs.unit.result }}
+          API_RES:       ${{ needs.integration-api.result }}
+          DB_RES:        ${{ needs.integration-db.result }}
+          SMOKE_RES:     ${{ needs.smoke.result }}
+          SITE_BLOCKED:  ${{ needs.integration-api.outputs.site_blocked }}
         with:
           github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
           script: |
-            const blocked     = process.env.SITE_BLOCKED === 'true'
-            const testOutcome = process.env.TEST_OUTCOME  // 'success' | 'failure' | 'skipped' | ''
             const [owner, repo] = process.env.TARGET_REPO.split('/')
+            const blocked = process.env.SITE_BLOCKED === 'true'
 
-            // If site was blocked, report success with a note rather than failure —
-            // a Cloudflare block is not a code defect in the app being tested.
-            const state       = blocked ? 'success'
-                              : testOutcome === 'success' ? 'success' : 'failure'
-            const description = blocked              ? '⚠ Skipped — target site unreachable from runner'
-                              : state === 'success' ? '✓ All API tests passed'
-                              : '✗ API tests failed'
+            const allPassed = ['UNIT_RES', 'API_RES', 'DB_RES', 'SMOKE_RES']
+              .every(k => process.env[k] === 'success')
+
+            const state = allPassed ? 'success' : 'failure'
+            const description = blocked
+              ? '⚠ API skipped (Cloudflare) — DB + smoke passed'
+              : allPassed
+                ? '✓ All checks passed'
+                : '✗ Pipeline failed — do not merge'
 
             await github.rest.repos.createCommitStatus({
-              owner,
-              repo,
+              owner, repo,
               sha:         process.env.TARGET_SHA,
               state,
               context:     'playwright / api-smoke',

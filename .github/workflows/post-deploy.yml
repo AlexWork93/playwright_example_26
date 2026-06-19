@@ -1,17 +1,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Post-deployment verification — runs against main (production) after
-# the staging → main merge completes.
+# Post-deployment verification — full pyramid against main (production).
 #
-# Triggered automatically by staging-to-main.yml immediately after merge.
-# Can also be triggered manually if you need to re-verify production.
+# Triggered automatically by staging-to-main.yml after the merge completes.
+# Can also be triggered manually to re-verify production at any time.
 #
-# A failure here means something broke during the deployment itself —
+# A failure here means something broke during deployment itself —
 # the code was green on staging but production is not behaving correctly.
+#
+# Pyramid:
+#   L1 Unit         → triggers unit-tests.yml in app repo (main branch), waits
+#   L2 Integration  → API + DB in parallel (needs L1 green)
+#   L3 E2E          → chromium + firefox in parallel (needs L2 green)
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Post-deploy — production verification
 
-run-name: "playwright_app_mocking main — post-deploy verification #${{ github.run_number }}"
+run-name: "playwright_app_mocking main — post-deploy verification (by @${{ github.actor }})"
 
 on:
   workflow_dispatch:
@@ -19,33 +23,79 @@ on:
 env:
   BASE_URL: ${{ vars.PROD_BASE_URL || 'https://automationexercise.com' }}
   API_URL:  ${{ vars.PROD_API_URL  || 'https://automationexercise.com' }}
+  APP_REPO: AlexWork93/playwright_app_mocking
 
 jobs:
 
-  # ── Stage 1: API ────────────────────────────────────────────────────────────
-  api:
-    name: API Tests — production
+  # ── L1: Unit (app repo) ─────────────────────────────────────────────────────
+  unit:
+    name: "L1 — Unit (app repo / main)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Trigger unit-tests.yml in app repo and wait
+        uses: actions/github-script@v7
+        env:
+          UNIT_TEST_REF: main
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.APP_REPO.split('/')
+            const ref           = process.env.UNIT_TEST_REF
+            const workflowId    = 'unit-tests.yml'
+            const createdAfter  = new Date().toISOString()
+
+            await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflowId, ref })
+            console.log(`Dispatched ${workflowId} on ${repo}@${ref}`)
+
+            await new Promise(r => setTimeout(r, 8000))
+
+            let run
+            for (let i = 0; i < 15; i++) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: workflowId, created: `>=${createdAfter}`, per_page: 1
+              })
+              if (data.workflow_runs.length > 0) { run = data.workflow_runs[0]; break }
+              console.log(`Waiting for run to appear... (${i + 1}/15)`)
+              await new Promise(r => setTimeout(r, 4000))
+            }
+            if (!run) return core.setFailed('Could not find the triggered unit test run')
+            console.log(`Found run #${run.id}`)
+
+            let polls = 0
+            while (run.status !== 'completed') {
+              if (polls++ > 20) return core.setFailed('Unit tests timed out')
+              await new Promise(r => setTimeout(r, 15000))
+              const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })
+              run = data
+              console.log(`Status: ${run.status} (poll ${polls})`)
+            }
+
+            console.log(`Conclusion: ${run.conclusion} — ${run.html_url}`)
+            if (run.conclusion !== 'success')
+              core.setFailed(`Unit tests ${run.conclusion} — ${run.html_url}`)
+
+  # ── L2: Integration — API ────────────────────────────────────────────────────
+  integration-api:
+    name: "L2 — Integration / API"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: unit
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - run: npx playwright install --with-deps chromium
-
       - name: Check target API is reachable
         id: connectivity
         run: |
@@ -53,7 +103,6 @@ jobs:
             -H "Accept: application/json" \
             https://automationexercise.com/api/productsList)
           echo "http_status=$STATUS" >> $GITHUB_OUTPUT
-
           RESPONSE_CODE=$(node -e "
             try {
               const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
@@ -62,21 +111,17 @@ jobs:
             } catch(e) { console.log('not-json'); }
           ")
           echo "response_code=$RESPONSE_CODE" >> $GITHUB_OUTPUT
-
           echo "HTTP status: $STATUS"
           echo "API responseCode field: $RESPONSE_CODE"
-
           if [ "$RESPONSE_CODE" != "200" ]; then
             echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
             echo "site_blocked=true" >> $GITHUB_OUTPUT
           else
             echo "site_blocked=false" >> $GITHUB_OUTPUT
           fi
-
       - name: Run API tests
         if: steps.connectivity.outputs.site_blocked == 'false'
         run: npm run test:api
-
       - name: Connectivity notice
         if: always()
         run: |
@@ -85,21 +130,47 @@ jobs:
           else
             echo "::notice::✓ Connectivity check passed — all API scenarios executed against production."
           fi
-
       - name: Upload API report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: report-api-prod-postdeploy
+          name: report-integration-api-prod-postdeploy
           path: playwright-report/
-          retention-days: 60    # keep production reports longer
+          retention-days: 60
 
-  # ── Stage 2: E2E (parallel matrix) ─────────────────────────────────────────
+  # ── L2: Integration — DB ─────────────────────────────────────────────────────
+  integration-db:
+    name: "L2 — Integration / DB"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: unit
+
+    env:
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run DB tests
+        run: npm run test:db
+      - name: Upload DB report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-integration-db-prod-postdeploy
+          path: playwright-report/
+          retention-days: 60
+
+  # ── L3: E2E ──────────────────────────────────────────────────────────────────
   e2e:
-    name: E2E — production — ${{ matrix.browser }}
+    name: "L3 — E2E / ${{ matrix.browser }}"
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: api
+    needs: [integration-api, integration-db]
 
     strategy:
       fail-fast: false
@@ -108,26 +179,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - name: Install browser — ${{ matrix.browser }}
         run: npx playwright install --with-deps ${{ matrix.browser }}
-
       - name: Run E2E tests — ${{ matrix.browser }}
         run: npx playwright test --project=${{ matrix.browser }}
-
       - name: Upload E2E report — ${{ matrix.browser }}
         uses: actions/upload-artifact@v4
         if: always()

@@ -1,4 +1,6 @@
 import { defineConfig, devices } from '@playwright/test'
+import dotenv from 'dotenv'
+dotenv.config()
 
 // Environment-aware base URL swap target without touching test code
 const BASE_URL = process.env.BASE_URL ?? 'https://automationexercise.com'
@@ -42,17 +44,17 @@ export default defineConfig({
     // ── UI projects ────────────────────────────────────────────────────────
     {
       name: 'chromium',
-      testIgnore: ['**/*.api.spec.ts', '**/contract/**', '**/performance/**', '**/visual/**', '**/accessibility/**'],
+      testIgnore: ['**/*.api.spec.ts', '**/*.db.spec.ts', '**/contract/**', '**/performance/**', '**/visual/**', '**/accessibility/**'],
       use: { ...devices['Desktop Chrome'] },
     },
     {
       name: 'firefox',
-      testIgnore: ['**/*.api.spec.ts', '**/contract/**', '**/performance/**', '**/visual/**', '**/accessibility/**'],
+      testIgnore: ['**/*.api.spec.ts', '**/*.db.spec.ts', '**/contract/**', '**/performance/**', '**/visual/**', '**/accessibility/**'],
       use: { ...devices['Desktop Firefox'] },
     },
     {
       name: 'mobile-chrome',
-      testIgnore: ['**/*.api.spec.ts', '**/contract/**', '**/performance/**', '**/visual/**', '**/accessibility/**'],
+      testIgnore: ['**/*.api.spec.ts', '**/*.db.spec.ts', '**/contract/**', '**/performance/**', '**/visual/**', '**/accessibility/**'],
       use: { ...devices['Pixel 7'] },
     },
 
@@ -107,6 +109,14 @@ export default defineConfig({
         launchOptions: { args: ['--enable-precise-memory-info'] },
       },
     },
+
+    // ── Database project no browser, direct PostgreSQL ────────────────────
+    // Requires SUPABASE_DATABASE_URL env var (local: .env, CI: GitHub Secret)
+    {
+      name: 'db',
+      testMatch: ['**/*.db.spec.ts'],
+    },
+
   ],
 
   // Global setup/teardown seed data, clean DB state, etc.

@@ -1,15 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Manual QA gate: run the full suite against staging before promoting.
+# Manual QA gate — full testing pyramid against staging before promoting.
 #
-# This workflow is triggered MANUALLY by a QA engineer or team lead after
-# a dev → staging deployment has been completed. It does NOT auto-merge —
-# a human reviews the results and decides whether to proceed.
+# Pyramid:
+#   L1 Unit         → triggers unit-tests.yml in app repo (dev branch), waits
+#   L2 Integration  → API + DB in parallel (needs L1 green)
+#   L3 E2E          → chromium + firefox in parallel (needs L2 green)
 #
-# Flow:
-#   1. Fetch the current dev branch HEAD SHA from playwright_app_mocking
-#   2. Post 'pending' commit status on that SHA
-#   3. Run full test suite against staging
-#   4. Post 'success' or 'failure' — unblocking or keeping the merge blocked
+# Posts commit status to playwright_app_mocking so the dev → staging
+# PR merge button stays blocked until this pipeline goes green.
 #
 # Trigger: Actions tab → "Dev → Staging QA gate" → Run workflow
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,44 +42,86 @@ jobs:
           github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
           script: |
             const [owner, repo] = process.env.APP_REPO.split('/')
-
             const { data: branch } = await github.rest.repos.getBranch({ owner, repo, branch: 'dev' })
             const sha = branch.commit.sha
             core.setOutput('sha', sha)
-
             await github.rest.repos.createCommitStatus({
               owner, repo, sha,
-              state:       'pending',
-              context:     'playwright / staging-gate',
+              state: 'pending', context: 'playwright / staging-gate',
               description: 'Staging QA gate running…',
             })
             console.log(`Posted 'pending' on ${owner}/${repo}@${sha.slice(0,7)}`)
 
-  # ── Stage 1: API ────────────────────────────────────────────────────────────
-  api:
-    name: API Tests — staging
+  # ── L1: Unit (app repo) ─────────────────────────────────────────────────────
+  unit:
+    name: "L1 — Unit (app repo / dev)"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: pre-notify
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Trigger unit-tests.yml in app repo and wait
+        uses: actions/github-script@v7
+        env:
+          UNIT_TEST_REF: dev
+        with:
+          github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
+          script: |
+            const [owner, repo] = process.env.APP_REPO.split('/')
+            const ref           = process.env.UNIT_TEST_REF
+            const workflowId    = 'unit-tests.yml'
+            const createdAfter  = new Date().toISOString()
 
+            await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflowId, ref })
+            console.log(`Dispatched ${workflowId} on ${repo}@${ref}`)
+
+            await new Promise(r => setTimeout(r, 8000))
+
+            let run
+            for (let i = 0; i < 15; i++) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: workflowId, created: `>=${createdAfter}`, per_page: 1
+              })
+              if (data.workflow_runs.length > 0) { run = data.workflow_runs[0]; break }
+              console.log(`Waiting for run to appear... (${i + 1}/15)`)
+              await new Promise(r => setTimeout(r, 4000))
+            }
+            if (!run) return core.setFailed('Could not find the triggered unit test run')
+            console.log(`Found run #${run.id}`)
+
+            let polls = 0
+            while (run.status !== 'completed') {
+              if (polls++ > 20) return core.setFailed('Unit tests timed out')
+              await new Promise(r => setTimeout(r, 15000))
+              const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })
+              run = data
+              console.log(`Status: ${run.status} (poll ${polls})`)
+            }
+
+            console.log(`Conclusion: ${run.conclusion} — ${run.html_url}`)
+            if (run.conclusion !== 'success')
+              core.setFailed(`Unit tests ${run.conclusion} — ${run.html_url}`)
+
+  # ── L2: Integration — API ────────────────────────────────────────────────────
+  integration-api:
+    name: "L2 — Integration / API"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: unit
+
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - run: npx playwright install --with-deps chromium
-
       - name: Check target API is reachable
         id: connectivity
         run: |
@@ -89,7 +129,6 @@ jobs:
             -H "Accept: application/json" \
             https://automationexercise.com/api/productsList)
           echo "http_status=$STATUS" >> $GITHUB_OUTPUT
-
           RESPONSE_CODE=$(node -e "
             try {
               const d = require('fs').readFileSync('/tmp/api_response.json','utf8');
@@ -98,22 +137,15 @@ jobs:
             } catch(e) { console.log('not-json'); }
           ")
           echo "response_code=$RESPONSE_CODE" >> $GITHUB_OUTPUT
-
-          echo "HTTP status: $STATUS"
-          echo "API responseCode field: $RESPONSE_CODE"
-
           if [ "$RESPONSE_CODE" != "200" ]; then
-            echo "::warning::automationexercise.com API returned '$RESPONSE_CODE' instead of 200."
-            echo "::warning::This is a known Cloudflare issue with cloud runner IPs."
+            echo "::warning::automationexercise.com returned '$RESPONSE_CODE' — Cloudflare issue."
             echo "site_blocked=true" >> $GITHUB_OUTPUT
           else
             echo "site_blocked=false" >> $GITHUB_OUTPUT
           fi
-
       - name: Run API tests
         if: steps.connectivity.outputs.site_blocked == 'false'
         run: npm run test:api
-
       - name: Connectivity notice
         if: always()
         run: |
@@ -122,21 +154,47 @@ jobs:
           else
             echo "::notice::✓ Connectivity check passed — all API scenarios executed against staging."
           fi
-
       - name: Upload API report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: report-api-staging-manual
+          name: report-integration-api-staging-manual
           path: playwright-report/
           retention-days: 30
 
-  # ── Stage 2: E2E (parallel matrix) ─────────────────────────────────────────
+  # ── L2: Integration — DB ─────────────────────────────────────────────────────
+  integration-db:
+    name: "L2 — Integration / DB"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: unit
+
+    env:
+      SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run DB tests
+        run: npm run test:db
+      - name: Upload DB report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-integration-db-staging-manual
+          path: playwright-report/
+          retention-days: 30
+
+  # ── L3: E2E ──────────────────────────────────────────────────────────────────
   e2e:
-    name: E2E — staging — ${{ matrix.browser }}
+    name: "L3 — E2E / ${{ matrix.browser }}"
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: api
+    needs: [integration-api, integration-db]
 
     strategy:
       fail-fast: false
@@ -145,26 +203,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
-
       - run: npm ci
-
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-
       - name: Install browser — ${{ matrix.browser }}
         run: npx playwright install --with-deps ${{ matrix.browser }}
-
       - name: Run E2E tests — ${{ matrix.browser }}
         run: npx playwright test --project=${{ matrix.browser }}
-
       - name: Upload E2E report — ${{ matrix.browser }}
         uses: actions/upload-artifact@v4
         if: always()
@@ -177,7 +229,7 @@ jobs:
   post-notify:
     name: Post final status
     runs-on: ubuntu-latest
-    needs: [pre-notify, api, e2e]
+    needs: [pre-notify, unit, integration-api, integration-db, e2e]
     if: always()
 
     steps:
@@ -185,25 +237,24 @@ jobs:
         uses: actions/github-script@v7
         env:
           DEV_SHA:    ${{ needs.pre-notify.outputs.dev_sha }}
-          API_RESULT: ${{ needs.api.result }}
-          E2E_RESULT: ${{ needs.e2e.result }}
+          UNIT_RES:   ${{ needs.unit.result }}
+          API_RES:    ${{ needs.integration-api.result }}
+          DB_RES:     ${{ needs.integration-db.result }}
+          E2E_RES:    ${{ needs.e2e.result }}
           RUN_ID:     ${{ github.run_id }}
         with:
           github-token: ${{ secrets.PLAYWRIGHT_SUITE_PAT }}
           script: |
             const [owner, repo] = process.env.APP_REPO.split('/')
-            const passed = process.env.API_RESULT === 'success' && process.env.E2E_RESULT === 'success'
-
-            const state       = passed ? 'success' : 'failure'
-            const description = passed ? '✓ All staging tests passed — safe to merge'
-                                       : '✗ Staging tests failed — do not merge'
-
+            const allPassed = ['UNIT_RES','API_RES','DB_RES','E2E_RES']
+              .every(k => process.env[k] === 'success')
+            const state       = allPassed ? 'success' : 'failure'
+            const description = allPassed
+              ? '✓ Full pyramid passed — safe to merge'
+              : '✗ Pipeline failed — do not merge'
             await github.rest.repos.createCommitStatus({
-              owner, repo,
-              sha:        process.env.DEV_SHA,
-              state,
-              context:    'playwright / staging-gate',
-              description,
+              owner, repo, sha: process.env.DEV_SHA, state,
+              context: 'playwright / staging-gate', description,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.RUN_ID}`,
             })
             console.log(`Posted '${state}' → ${description}`)
