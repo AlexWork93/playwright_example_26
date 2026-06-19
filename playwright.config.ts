@@ -19,11 +19,9 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? '100%' : 2,
 
-  // Allure + list on every run; HTML report generated but not auto-opened
   reporter: [
     ['list'],
-    ['html',   { outputFolder: 'playwright-report', open: 'never' }],
-    ['allure-playwright', { outputFolder: 'allure-results', open: 'never' }],
+    ['html', { outputFolder: 'playwright-report', open: 'never' }],
   ],
 
   use: {

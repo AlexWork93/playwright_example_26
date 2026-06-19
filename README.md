@@ -1,6 +1,8 @@
 # playwright-suite
 
-Target app: [automationexercise.com](https://automationexercise.com) — a public e-commerce site with both UI and REST API.
+Test suite for [automationexercise.com](https://automationexercise.com) — a public e-commerce site with UI, REST API, and database layers.
+
+Part of a two-repo CI system alongside `playwright_app_mocking` (the app repo).
 
 ## Stack
 
@@ -8,9 +10,10 @@ Target app: [automationexercise.com](https://automationexercise.com) — a publi
 |---|---|
 | Playwright `^1.60` | Test framework (browser + API) |
 | TypeScript (strict) | Language |
+| `pg` | PostgreSQL client for DB integration tests |
+| Supabase | Hosted PostgreSQL database (eu-west-1) |
 | `@faker-js/faker` | Test data generation |
 | `@axe-core/playwright` | Accessibility scanning |
-| `allure-playwright` | Rich HTML reporting |
 
 ---
 
@@ -18,7 +21,13 @@ Target app: [automationexercise.com](https://automationexercise.com) — a publi
 
 ```bash
 npm install
-npx playwright install  
+npx playwright install
+```
+
+For DB tests locally, create a `.env` file in the repo root:
+
+```
+SUPABASE_DATABASE_URL=postgresql://postgres.[ref]:[password]@aws-0-eu-west-1.pooler.supabase.com:5432/postgres
 ```
 
 ---
@@ -30,14 +39,15 @@ npx playwright install
 npm test
 ```
 
-### Run by project
+### Run by layer
 ```bash
-npm run test:api        # REST API tests only (no browser)
-npm run test:e2e        # E2E UI tests — Chromium
-npm run test:mobile          # E2E UI tests — Pixel 7 (mobile Chrome)
-npx playwright test --project=firefox          # E2E UI tests — Firefox
-npx playwright test --project=visual           # Visual regression (compare to baselines)
-npx playwright test --project=accessibility    # Accessibility / WCAG 2 AA
+npm run test:api        # L2 Integration — REST API tests (no browser)
+npm run test:db         # L2 Integration — DB tests against Supabase
+npm run test:e2e        # L3 E2E — Chromium
+npx playwright test --project=firefox       # L3 E2E — Firefox
+npm run test:mobile     # L3 E2E — Pixel 7 (mobile Chrome)
+npx playwright test --project=visual        # Visual regression
+npx playwright test --project=accessibility # Accessibility / WCAG 2 AA
 npm run test:perf       # Performance — CDP + Core Web Vitals
 ```
 
@@ -45,8 +55,9 @@ npm run test:perf       # Performance — CDP + Core Web Vitals
 ```bash
 npx playwright test tests/e2e/auth.spec.ts
 npx playwright test tests/api/users.api.spec.ts
-npx playwright test --grep "login"             # all tests whose name matches "login"
-npx playwright test --grep-invert "slow"       # exclude tests matching "slow"
+npx playwright test tests/db/products.db.spec.ts
+npx playwright test --grep "login"
+npx playwright test --grep-invert "slow"
 ```
 
 ### Debug modes
@@ -63,11 +74,8 @@ npm run test:ui         # Playwright UI mode — interactive test explorer
 Baselines are committed to `tests/visual/__snapshots__/`.
 
 ```bash
-# Compare screenshots against baselines (normal CI run)
-npx playwright test --project=visual
-
-# Regenerate all baselines after an intentional UI change
-npx playwright test --project=visual --update-snapshots
+npx playwright test --project=visual                   # compare against baselines
+npx playwright test --project=visual --update-snapshots  # regenerate after intentional UI change
 ```
 
 ---
@@ -75,12 +83,8 @@ npx playwright test --project=visual --update-snapshots
 ## Reports
 
 ```bash
-npm run report:html     # open the built-in HTML report (last run)
-npm run report:allure   # generate + open Allure report (requires allure CLI)
+npm run report:html     # open the built-in Playwright HTML report (last run)
 ```
-
-> **Allure CLI** — install once with `npm install -g allure-commandline` or via  
-> `brew install allure` (macOS) / `scoop install allure` (Windows).
 
 ---
 
@@ -99,10 +103,9 @@ The other half is `playwright_app_mocking` — the product/app repo where develo
 
 ### Repositories
 
-| Repo | Role |
-|---|---|
-| `playwright_app_mocking` | App code. Unit tests live here. Developers open PRs here. |
-| `playwright_example_26` (this repo) | Test suite. Integration (API + DB) and E2E tests live here. |
+|           Repo                     | Role                                                        |
+|`playwright_app_mocking`            | App code. Unit tests live here. Developers open PRs here.   |
+|`playwright_example_26` (this repo) | Test suite. Integration (API + DB) and E2E tests live here. |
 
 ---
 
@@ -114,7 +117,24 @@ Both repos follow the same promotion chain:
 feature/* → dev → staging → main
 ```
 
-Merging is always in that direction. `main` is production. `staging` is the release candidate. `dev` is the integration branch.
+`main` is production. `staging` is the release candidate. `dev` is the integration branch. Merging always goes in that direction.
+
+---
+
+### Testing pyramid
+
+Every pipeline follows the same three-level structure:
+
+```
+L3  E2E              chromium + firefox (parallel)
+     ↑ needs both L2 jobs green
+L2  Integration      API tests  |  DB tests  (parallel)
+     ↑ needs L1 green
+L1  Unit             app_side_unit_tests.yml in playwright_app_mocking (trigger + wait)
+```
+
+Unit tests always run in the **app repo** on the branch being tested (`dev`, `staging`, or `main`).
+Integration and E2E tests always run in **this repo**.
 
 ---
 
@@ -122,23 +142,23 @@ Merging is always in that direction. `main` is production. `staging` is the rele
 
 #### 1. `daily-dev.yml` — Daily regression (08:00 Kyiv, every day)
 
-Verifies the current state of `dev` every morning.
+Verifies the current state of `dev` every morning. Can also be triggered manually.
 
 ```
-[cron / manual]
+[cron 08:00 Kyiv / manual]
     │
     ▼
-L1  Trigger unit-tests.yml on playwright_app_mocking @ dev — wait for result
+L1  Trigger app_side_unit_tests.yml on playwright_app_mocking @ dev — wait
     │
     ├──▶ L2  Integration / API   ──┐
     │                              ├──▶ L3  E2E chromium
     └──▶ L2  Integration / DB    ──┘    L3  E2E firefox
 ```
 
-#### 2. `dev-to-staging.yml` — Manual QA gate (run from Actions tab)
+#### 2. `dev-to-staging.yml` — Manual QA gate
 
-Triggered manually by a QA engineer before merging `dev → staging`.
-Posts a commit status to `playwright_app_mocking` — the `dev → staging` PR merge button stays blocked until this pipeline goes green.
+Triggered manually by a QA engineer from the Actions tab before merging `dev → staging`.
+Posts a commit status to `playwright_app_mocking` — the PR merge button stays blocked until this pipeline goes green.
 
 ```
 [manual dispatch]
@@ -147,66 +167,71 @@ Posts a commit status to `playwright_app_mocking` — the `dev → staging` PR m
     Set playwright / staging-gate → pending on app repo dev HEAD
     │
     ▼
-L1  Trigger unit-tests.yml on playwright_app_mocking @ dev — wait for result
+L1  Trigger app_side_unit_tests.yml on playwright_app_mocking @ dev — wait
     │
     ├──▶ L2  Integration / API   ──┐
     │                              ├──▶ L3  E2E chromium
     └──▶ L2  Integration / DB    ──┘    L3  E2E firefox
     │
     ▼
-    Set playwright / staging-gate → success ✓  (or failure ✗)
-    → dev → staging PR is now unblocked (or stays blocked)
+    Set playwright / staging-gate → success ✓ (or failure ✗)
+    → dev → staging PR merge button unblocked (or stays blocked)
 ```
 
-#### 3. `staging-to-main.yml` — Friday deployment (09:00 Kyiv, every Friday)
+#### 3. `staging-to-main.yml` — Deployment (09:00 Kyiv every Friday, or manual)
 
-Runs the full pyramid against staging, then promotes staging to main via an auto-created PR.
-After merging it triggers `post-deploy.yml` automatically.
+Runs the full pyramid against staging, then promotes staging to main via an auto-created PR with full audit trail. After merging, triggers `post-deploy.yml` automatically.
 
 ```
-[cron Friday 09:00 / manual]
+[cron Friday 09:00 Kyiv / manual]
     │
     ▼
-L1  Trigger unit-tests.yml on playwright_app_mocking @ staging — wait for result
+L1  Trigger app_side_unit_tests.yml on playwright_app_mocking @ staging — wait
     │
     ├──▶ L2  Integration / API   ──┐
     │                              ├──▶ L3  E2E chromium
     └──▶ L2  Integration / DB    ──┘    L3  E2E firefox
     │
     ▼
-    Promote: create PR staging → main in app repo, merge it
+    Create PR staging → main in playwright_app_mocking, merge it
     │
     ▼
     Dispatch post-deploy.yml on main
 ```
 
-#### 4. `post-deploy.yml` — Production verification (triggered by staging-to-main)
+#### 4. `post-deploy.yml` — Production verification
 
-Verifies that main (production) is healthy immediately after a deployment.
+Triggered automatically by `staging-to-main.yml` after the merge, or manually at any time.
 
 ```
 [dispatch from staging-to-main / manual]
     │
     ▼
-L1  Trigger unit-tests.yml on playwright_app_mocking @ main — wait for result
+L1  Trigger app_side_unit_tests.yml on playwright_app_mocking @ main — wait
     │
     ├──▶ L2  Integration / API   ──┐
     │                              ├──▶ L3  E2E chromium
     └──▶ L2  Integration / DB    ──┘    L3  E2E firefox
 ```
 
-#### 5. `on-dispatch.yml` — PR smoke test (triggered by app repo)
+Artifacts retained for 60 days (vs 30 days in other pipelines).
 
-Fires when a developer opens a PR in `playwright_app_mocking` (excluding PRs targeting `staging` and `main`). The app repo runs unit tests first, then dispatches this workflow. Posts the result back as a commit status so the PR is blocked until smoke tests pass.
+#### 5. `on-dispatch.yml` — PR check (triggered by app repo)
+
+Fires when a developer opens a PR in `playwright_app_mocking` targeting `dev`. Unit tests run on the app side first, then this workflow is dispatched. Posts the result back as a commit status — PR is blocked until all checks pass.
 
 ```
-[repository_dispatch from playwright_app_mocking]
+[repository_dispatch from playwright_app_mocking / manual]
     │
     ▼
-    Cloudflare connectivity check
+L1  Unit (placeholder — unit tests already ran in app repo before dispatch)
+    │
+    ├──▶ L2  Integration / API (Cloudflare check; skipped with warning if blocked)
+    │
+    └──▶ L2  Integration / DB
     │
     ▼
-    API smoke tests (skipped with warning if Cloudflare blocks the runner)
+L3  Smoke (placeholder — replace with npx playwright test --project=smoke)
     │
     ▼
     Post playwright / api-smoke → success or failure on app repo commit
@@ -221,10 +246,10 @@ Fires when a developer opens a PR in `playwright_app_mocking` (excluding PRs tar
 ```
 Developer opens PR: feature/* → dev
 
-playwright_app_mocking / trigger-tests.yml fires:
-  1. Unit tests run (in app repo)
+app_side_flow.yml fires:
+  1. Unit tests run (placeholder, always passes)
   2. Dispatch → playwright_example_26 / on-dispatch.yml
-  3. Smoke test result posted back as commit status
+  3. Full check result posted back as commit status
   4. Merge button unblocked when status is green
 ```
 
@@ -233,42 +258,26 @@ playwright_app_mocking / trigger-tests.yml fires:
 ```
 Developer opens PR: dev → staging
 
-playwright_app_mocking / app_side_staging_gate.yml fires:
-  → Posts playwright / staging-gate as "pending — waiting for manual QA gate"
-  → Merge button is immediately blocked
+app_side_staging_gate.yml fires immediately:
+  → Posts playwright / staging-gate → pending
+  → Merge button is blocked
 
-QA engineer goes to playwright_example_26 → Actions → "Dev → Staging — manual QA gate" → Run workflow
-  → Full pyramid runs (unit → integration → E2E)
+QA engineer: playwright_example_26 → Actions → "Dev → Staging — manual QA gate" → Run workflow
+  → Full pyramid runs (L1 unit → L2 integration → L3 E2E)
   → On success: posts playwright / staging-gate → success
-  → Merge button is now unblocked
+  → Merge button unblocked
 ```
 
 #### Merging staging → main
 
 ```
-Happens automatically every Friday at 09:00 Kyiv time.
-staging-to-main.yml runs the full pyramid on staging, then:
-  → Creates PR staging → main in playwright_app_mocking
-  → Merges it automatically (audit trail preserved in PR history)
+Automatically every Friday at 09:00 Kyiv, or triggered manually any time.
+
+staging-to-main.yml:
+  → Runs full pyramid on staging
+  → Creates and merges PR staging → main (audit trail in PR history)
   → Dispatches post-deploy.yml to verify production
 ```
-
----
-
-### Testing pyramid
-
-Every pipeline follows the same three-level structure:
-
-```
-L3  E2E              chromium + firefox (parallel)
-     ↑ needs both L2 jobs green
-L2  Integration      API tests  |  DB tests  (parallel)
-     ↑ needs L1 green
-L1  Unit             unit-tests.yml in playwright_app_mocking (trigger + wait)
-```
-
-Unit tests always run in the **app repo** on the branch being tested (`dev`, `staging`, or `main`).
-Integration and E2E tests always run in **this repo**.
 
 ---
 
@@ -279,6 +288,7 @@ playwright-suite/
 ├── tests/
 │   ├── e2e/            # UI tests — auth, products, cart, mocking
 │   ├── api/            # REST API tests (*.api.spec.ts)
+│   ├── db/             # Database tests against Supabase (*.db.spec.ts)
 │   ├── visual/         # Screenshot regression
 │   ├── accessibility/  # axe-core / WCAG 2 AA
 │   └── performance/    # CDP metrics + Core Web Vitals
@@ -286,7 +296,7 @@ playwright-suite/
 ├── fixtures/           # Custom test fixtures (testUser, loggedInPage, …)
 ├── api-client/         # Typed AE REST API wrapper
 ├── test-data/          # userFactory() + faker helpers
-└── utils/              # a11y helpers (runAxe, checkA11y)
+└── utils/              # DB client (db-client.ts), a11y helpers
 ```
 
 ## Test projects explained
@@ -297,6 +307,7 @@ playwright-suite/
 | `firefox` | All E2E UI tests | `--project=firefox` |
 | `mobile-chrome` | All E2E UI tests (Pixel 7) | `--project=mobile-chrome` |
 | `api` | `*.api.spec.ts` files only — no browser | `--project=api` |
+| `db` | `*.db.spec.ts` files — Supabase integration | `--project=db` |
 | `visual` | `tests/visual/**` — screenshot diffs | `--project=visual` |
 | `accessibility` | `tests/accessibility/**` — axe scans | `--project=accessibility` |
 | `performance` | `tests/performance/**` — CDP / CWV | `--project=performance` |
